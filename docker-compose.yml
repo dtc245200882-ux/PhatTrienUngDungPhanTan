@@ -1,0 +1,138 @@
+services:
+  mongodb:
+    image: mongo:8
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - video_network
+
+  minio:
+    image: bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - video_network
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-videoapp}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-videoapp_password}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - video_network
+
+  video-api:
+    build:
+      context: .
+      dockerfile: src/Video.API/Dockerfile
+    image: video-api:local
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_HTTP_PORTS: "8080"
+      MongoDB__ConnectionString: mongodb://mongodb:27017
+      MongoDB__DatabaseName: VideoProcessingDb
+      MongoDB__CollectionName: Videos
+      MinIO__Endpoint: minio:9000
+      MinIO__AccessKey: ${MINIO_ROOT_USER:-minioadmin}
+      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MinIO__UseSSL: "false"
+      MinIO__BucketName: videos
+      RabbitMQ__Uri: "amqp://${RABBITMQ_DEFAULT_USER:-videoapp}:${RABBITMQ_DEFAULT_PASS:-videoapp_password}@rabbitmq:5672/"
+      RabbitMQ__QueueName: video-uploaded
+    ports:
+      - "8081:8080"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - video_network
+
+  video-worker:
+    build:
+      context: .
+      dockerfile: src/Video.Worker/Dockerfile
+    image: video-worker:local
+    restart: unless-stopped
+    environment:
+      MongoDB__ConnectionString: mongodb://mongodb:27017
+      MongoDB__DatabaseName: VideoProcessingDb
+      MongoDB__CollectionName: Videos
+      MinIO__Endpoint: minio:9000
+      MinIO__AccessKey: ${MINIO_ROOT_USER:-minioadmin}
+      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MinIO__UseSSL: "false"
+      MinIO__BucketName: videos
+      RabbitMQ__Uri: "amqp://${RABBITMQ_DEFAULT_USER:-videoapp}:${RABBITMQ_DEFAULT_PASS:-videoapp_password}@rabbitmq:5672/"
+      RabbitMQ__QueueName: video-uploaded
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - video_network
+
+  web-client:
+    build:
+      context: .
+      dockerfile: src/Web.Client/Dockerfile
+    image: web-client:local
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_HTTP_PORTS: "8080"
+      VideoApi__BaseUrl: http://video-api:8080/
+    ports:
+      - "8080:8080"
+    depends_on:
+      - video-api
+    networks:
+      - video_network
+
+volumes:
+  mongodb_data:
+  minio_data:
+  rabbitmq_data:
+
+networks:
+  video_network:
+    driver: bridge

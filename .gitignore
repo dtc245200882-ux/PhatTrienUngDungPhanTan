@@ -1,0 +1,36 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+[Ll]ogs/
+[Dd]ebug/
+[Rr]elease/
+[Aa]rtifacts/
+
+# Visual Studio and IDE files
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Test output
+[Tt]est[Rr]esult*/
+TestResults/
+
+# NuGet packages and generated restore files
+*.nupkg
+*.snupkg
+**/packages/*
+!**/packages/build/
+project.lock.json
+project.fragment.lock.json
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db

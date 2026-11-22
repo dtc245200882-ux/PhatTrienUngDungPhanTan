@@ -1,0 +1,258 @@
+﻿@page "/"
+@implements IAsyncDisposable
+@using System.Net.Http.Headers
+@using Web.Client.Models
+@inject HttpClient Http
+
+<PageTitle>Video pipeline</PageTitle>
+
+<div class="dashboard">
+	<section class="page-heading">
+		<div>
+			<p class="eyebrow">MEDIA OPERATIONS / INGEST</p>
+			<h1>Video queue</h1>
+			<p class="page-description">Upload source media and monitor its processing state.</p>
+		</div>
+		<div class="record-count" aria-label="Tracked videos">
+			<strong>@_videos.Count.ToString("D2")</strong>
+			<span>RECORDS</span>
+		</div>
+	</section>
+
+	<section class="upload-panel" aria-labelledby="upload-heading">
+		<div class="panel-heading">
+			<div>
+				<p class="eyebrow">NEW ASSET</p>
+				<h2 id="upload-heading">Upload video</h2>
+			</div>
+			<span class="panel-index">01</span>
+		</div>
+
+		<div class="upload-controls">
+			<label class="file-picker">
+				<InputFile OnChange="HandleFileSelected" accept="video/*" class="file-input" />
+				<span class="file-symbol">+</span>
+				<span class="file-details">
+					<strong>@(_selectedFile?.Name ?? "Choose a video file")</strong>
+					<small>@(_selectedFile is null ? "MP4, MOV, or another video format" : FormatBytes(_selectedFile.Size))</small>
+				</span>
+				<span class="file-browse">BROWSE</span>
+			</label>
+			<button class="upload-button" @onclick="UploadAsync" disabled="@(_selectedFile is null || _isUploading)">
+				<span>@(_isUploading ? "Uploading..." : "Upload video")</span>
+				<span aria-hidden="true">&#8599;</span>
+			</button>
+		</div>
+
+		@if (_uploadMessage is not null)
+		{
+			<p class="feedback success" role="status">@_uploadMessage</p>
+		}
+		@if (_errorMessage is not null)
+		{
+			<p class="feedback error" role="alert">@_errorMessage</p>
+		}
+	</section>
+
+	<section class="video-list" aria-labelledby="list-heading">
+		<div class="list-heading">
+			<div>
+				<p class="eyebrow">PROCESSING ACTIVITY</p>
+				<h2 id="list-heading">Recent videos</h2>
+			</div>
+			<div class="live-state @( _errorMessage is null ? "online" : "offline")">
+				<span class="live-dot"></span>
+				<span>@(_errorMessage is null ? "LIVE" : "API OFFLINE")</span>
+			</div>
+		</div>
+
+		@if (_videos.Count == 0 && _isLoading)
+		{
+			<div class="empty-state">Loading video records...</div>
+		}
+		else if (_videos.Count == 0)
+		{
+			<div class="empty-state">
+				<strong>No videos yet</strong>
+				<span>Uploaded videos will appear here.</span>
+			</div>
+		}
+		else
+		{
+			<div class="table-scroll">
+				<table>
+					<thead>
+						<tr>
+							<th scope="col">FILE</th>
+							<th scope="col">VIDEO ID</th>
+							<th scope="col">UPLOADED</th>
+							<th scope="col">STATUS</th>
+						</tr>
+					</thead>
+					<tbody>
+						@foreach (var video in _videos)
+						{
+							<tr @key="video.Id">
+								<td class="file-name" title="@video.FileName">@video.FileName</td>
+								<td><code title="@video.Id">@ShortId(video.Id)</code></td>
+								<td class="date-cell">@video.UploadedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
+								<td><span class="status-badge @StatusClass(video.Status)">@video.Status</span></td>
+							</tr>
+						}
+					</tbody>
+				</table>
+			</div>
+		}
+	</section>
+</div>
+
+@code {
+	private const long MaxUploadSize = 1_000_000_000;
+	private readonly CancellationTokenSource _refreshCancellation = new();
+	private List<VideoListItem> _videos = [];
+	private IBrowserFile? _selectedFile;
+	private Task? _refreshTask;
+	private string? _errorMessage;
+	private string? _uploadMessage;
+	private bool _isLoading = true;
+	private bool _isUploading;
+
+	protected override async Task OnInitializedAsync()
+	{
+		await RefreshVideosAsync();
+		_refreshTask = RefreshLoopAsync(_refreshCancellation.Token);
+	}
+
+	private void HandleFileSelected(InputFileChangeEventArgs args)
+	{
+		_selectedFile = args.File;
+		_uploadMessage = null;
+		_errorMessage = null;
+	}
+
+	private async Task UploadAsync()
+	{
+		if (_selectedFile is null || _isUploading)
+		{
+			return;
+		}
+
+		_isUploading = true;
+		_uploadMessage = null;
+		_errorMessage = null;
+
+		try
+		{
+			await using var fileStream = _selectedFile.OpenReadStream(
+				MaxUploadSize,
+				_refreshCancellation.Token);
+			using var multipart = new MultipartFormDataContent();
+			using var fileContent = new StreamContent(fileStream);
+			fileContent.Headers.ContentType = new MediaTypeHeaderValue(
+				string.IsNullOrWhiteSpace(_selectedFile.ContentType)
+					? "application/octet-stream"
+					: _selectedFile.ContentType);
+			multipart.Add(fileContent, "file", _selectedFile.Name);
+
+			using var response = await Http.PostAsync(
+				"api/videos/upload",
+				multipart,
+				_refreshCancellation.Token);
+
+			if (!response.IsSuccessStatusCode)
+			{
+				_errorMessage = $"Upload failed with HTTP {(int)response.StatusCode}.";
+				return;
+			}
+
+			_uploadMessage = "Upload accepted. The video is now in the queue.";
+			_selectedFile = null;
+			await RefreshVideosAsync();
+		}
+		catch (OperationCanceledException) when (_refreshCancellation.IsCancellationRequested)
+		{
+		}
+		catch (Exception exception)
+		{
+			_errorMessage = exception is HttpRequestException
+				? "Could not reach Video.API. Check the API address and try again."
+				: exception.Message;
+		}
+		finally
+		{
+			_isUploading = false;
+		}
+	}
+
+	private async Task RefreshVideosAsync()
+	{
+		_isLoading = true;
+		try
+		{
+			_videos = await Http.GetFromJsonAsync<List<VideoListItem>>(
+				"api/videos",
+				_refreshCancellation.Token) ?? [];
+			_errorMessage = null;
+		}
+		catch (OperationCanceledException) when (_refreshCancellation.IsCancellationRequested)
+		{
+		}
+		catch (HttpRequestException)
+		{
+			_errorMessage = "Could not reach Video.API. Check the API address and try again.";
+		}
+		finally
+		{
+			_isLoading = false;
+		}
+	}
+
+	private async Task RefreshLoopAsync(CancellationToken cancellationToken)
+	{
+		using var timer = new PeriodicTimer(TimeSpan.FromSeconds(3));
+		try
+		{
+			while (await timer.WaitForNextTickAsync(cancellationToken))
+			{
+				await InvokeAsync(async () =>
+				{
+					await RefreshVideosAsync();
+					StateHasChanged();
+				});
+			}
+		}
+		catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+		{
+		}
+	}
+
+	private static string StatusClass(string status) => status.ToLowerInvariant() switch
+	{
+		"pending" => "pending",
+		"processing" => "processing",
+		"completed" => "completed",
+		"failed" => "failed",
+		_ => "unknown"
+	};
+
+	private static string ShortId(string id) => id.Length > 8 ? id[..8] : id;
+
+	private static string FormatBytes(long bytes) => bytes switch
+	{
+		>= 1_000_000_000 => $"{bytes / 1_000_000_000d:0.##} GB",
+		>= 1_000_000 => $"{bytes / 1_000_000d:0.##} MB",
+		>= 1_000 => $"{bytes / 1_000d:0.##} KB",
+		_ => $"{bytes} B"
+	};
+
+	public async ValueTask DisposeAsync()
+	{
+		await _refreshCancellation.CancelAsync();
+		if (_refreshTask is not null)
+		{
+			await _refreshTask;
+		}
+
+		_refreshCancellation.Dispose();
+	}
+}
