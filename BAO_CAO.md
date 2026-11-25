@@ -1,224 +1,218 @@
 # BÁO CÁO BÀI TẬP LỚN
 
-# Hệ thống xử lý video phân tán bất đồng bộ bằng .NET 10
+# Đề tài 14: Hệ thống xử lý video bất đồng bộ
 
-## 1. Mô tả bài toán
+## 1. Bài toán
 
-Dự án xây dựng một hệ thống xử lý video theo kiến trúc phân tán, tách luồng upload, lưu trữ file, quản lý trạng thái và xử lý nền. Người dùng chọn video qua giao diện Blazor Server. API nhận file, lưu nội dung vào MinIO, lưu metadata vào MongoDB và phát một message sang RabbitMQ. Worker tiếp tục lấy message để tải file tạm về máy, mô phỏng xử lý nặng bằng `Task.Delay(5000)`, cập nhật trạng thái và xác nhận/xóa message khỏi hàng đợi.
+Upload video có thể kéo theo các tác vụ tốn CPU, bộ nhớ và thời gian như phân tích metadata, chuyển mã hoặc tạo thumbnail. Nếu xử lý ngay trong request HTTP, người dùng phải chờ lâu; request có thể timeout và API khó mở rộng độc lập với tải xử lý.
 
-Các trạng thái video gồm:
+Đề tài xây dựng hệ thống phân tán tách tiếp nhận video khỏi xử lý nền. API lưu file và metadata, phát sinh job vào message broker, Worker xử lý độc lập và ghi trạng thái để client truy vấn. Thiết kế hướng tới khả năng tiếp tục xử lý sau khi Worker khởi động lại, tránh xử lý lặp không cần thiết và cô lập message lỗi.
 
-- `Pending`: file đã upload nhưng Worker chưa bắt đầu xử lý.
-- `Processing`: Worker đang xử lý file.
-- `Completed`: xử lý giả lập hoàn thành.
-- `Failed`: xảy ra lỗi trong quá trình xử lý.
+Bản hiện tại lưu video và artifact trên MinIO, quản lý video/job trên hai collection MongoDB. Worker tạo thumbnail JPEG bằng FFmpeg, trích xuất metadata file thành JSON và tạo artifact JSON mô phỏng cho tác vụ transcode (chưa chuyển mã codec thật).
 
 ## 2. Phân tích yêu cầu
 
 ### 2.1 Yêu cầu chức năng
 
-- Người dùng chọn và upload một file video từ Web.Client.
-- API sinh GUID làm `VideoId`, tải file vào bucket `videos` của MinIO và lưu metadata vào MongoDB.
-- API phát `VideoUploadedMessage` chứa `VideoId` và `FileName` qua RabbitMQ.
-- Worker consume queue, cập nhật trạng thái, tải file xuống thư mục tạm và mô phỏng xử lý trong 5 giây.
-- Worker xác nhận message bằng Ack sau khi hoàn thành; khi lỗi cập nhật `Failed` và dùng Nack.
-- Giao diện hiển thị danh sách video và tự làm mới mỗi 3 giây.
+- Nhận multipart upload video, lưu object vào MinIO và metadata vào MongoDB.
+- Tạo job riêng cho video, lưu job trước khi gửi message đến RabbitMQ.
+- Worker nhận job, cập nhật trạng thái và ghi kết quả/lỗi.
+- Tra cứu danh sách video có lọc trạng thái, chi tiết video cùng các job liên quan, trạng thái/tiến độ từng job và tải artifact kết quả.
+- Endpoint nghiệp vụ gọi được ở cả dạng `/videos` và `/api/videos`.
+- Truyền Correlation ID từ HTTP qua message sang log Worker.
 
 ### 2.2 Yêu cầu phi chức năng
 
-- Các thành phần chạy độc lập trong container Docker.
-- Giao tiếp nội bộ qua DNS của Docker network.
-- Sử dụng named volume để duy trì dữ liệu MongoDB, MinIO và RabbitMQ.
-- Cấu hình có thể ghi đè bằng environment variables.
-- API và Worker có build/runtime image riêng.
+- Chạy các thành phần qua Docker Compose và Docker network riêng.
+- Lấy connection string, host dịch vụ và credentials từ biến môi trường; không đưa secrets vào source hoặc appsettings.
+- Dùng durable queue và persistent message.
+- Worker dùng manual acknowledgement; chỉ ack sau xử lý thành công, retry hoặc chuyển DLQ thành công.
+- Chống xử lý lặp job đã hoàn thành, có retry giới hạn và DLQ.
+- Có health endpoint cho API và Worker để Docker giám sát.
 
-## 3. Sơ đồ kiến trúc hệ thống
+## 3. Kiến trúc hệ thống
 
 ```mermaid
 flowchart LR
-    U[Người dùng] --> C[Web.Client<br/>Blazor Server]
-    C -->|HTTP multipart POST /api/videos/upload| A[Video.API<br/>ASP.NET Core Minimal API]
-    C -->|HTTP GET /api/videos| A
+    User[Người dùng] --> Client[Web.Client<br/>Blazor Server]
+    Client -->|HTTP upload và tạo job| API[Video.API<br/>Minimal API .NET 10]
+    Client -->|HTTP truy vấn| API
+    API -->|Object video| Storage[(MinIO)]
+    API -->|Video metadata và Job| Mongo[(MongoDB)]
+    API -->|Persistent VideoJobMessage| Broker[(RabbitMQ)]
+    Broker -->|Consume manual ack| Worker[Video.Worker<br/>BackgroundService]
+    Worker -->|Cập nhật trạng thái/kết quả| Mongo
+    Worker -->|Tải object nguồn| Storage
+    Worker -->|Thử lại sau TTL| Retry[(Retry Queue)]
+    Retry -->|Hết TTL| Broker
+    Worker -->|Quá số lần retry| DLQ[(Dead-letter Queue)]
 
-    A -->|Lưu object| M[MinIO<br/>Bucket videos]
-    A -->|Lưu metadata| DB[(MongoDB<br/>VideoProcessingDb)]
-    A -->|Publish VideoUploadedMessage| Q[(RabbitMQ<br/>video-uploaded)]
-
-    Q -->|Consume| W[Video.Worker<br/>BackgroundService]
-    W -->|Cập nhật trạng thái| DB
-    W -->|Tải file tạm| M
-
-    subgraph Docker Network: video_network
-        C
-        A
-        W
-        M
-        DB
-        Q
+    subgraph Docker Compose
+        Client
+        API
+        Worker
+        Storage
+        Mongo
+        Broker
+        Retry
+        DLQ
     end
 ```
 
+Client giao tiếp đồng bộ với API qua HTTP. RabbitMQ tách API khỏi xử lý video. MongoDB lưu trạng thái nghiệp vụ; MinIO giữ nội dung video. Queue retry có thời gian chờ trước khi message quay lại queue chính. Message vượt số lần thử được Worker publish vào dead-letter queue riêng.
+
 ## 4. Thiết kế các thành phần
 
-### 4.1 Video.Contracts
+### 4.1 Web.Client
 
-Project chứa record dùng chung để serial hóa message RabbitMQ:
-
-```csharp
-public sealed record VideoUploadedMessage(string VideoId, string FileName);
-```
-
-Việc đặt contract ở project riêng tránh trùng định nghĩa và giúp API cùng Worker dùng một cấu trúc message nhất quán.
+Blazor Server cung cấp giao diện upload, chọn loại job, lọc video theo trạng thái, theo dõi tiến độ và xem/tải artifact. Luồng upload thực hiện hai request: gửi file tới `POST /videos`, sau đó tạo job bằng `POST /videos/{id}/jobs`. Client tạo một Correlation ID và gửi cùng giá trị qua header `X-Correlation-ID` của cả hai request.
 
 ### 4.2 Video.API
 
-Video.API là ASP.NET Core Minimal API trên .NET 10.
+Minimal API có năm endpoint nghiệp vụ; mỗi route được ánh xạ hai lần để hỗ trợ cả tiền tố rỗng và `/api`:
 
-#### Endpoint upload
+| Phương thức | Route | Chức năng |
+| --- | --- | --- |
+| `POST` | `/videos` | Multipart field `file`; lưu file MinIO và metadata MongoDB. |
+| `POST` | `/videos/{id}/jobs` | Tạo job `Thumbnail`, `Metadata` hoặc `Transcode`, publish `VideoJobMessage`, trả `202 Accepted`. |
+| `GET` | `/videos` | Liệt kê video mới nhất trước; hỗ trợ `?status=Completed`. |
+| `GET` | `/videos/{id}` | Trả video và các job liên quan. |
+| `GET` | `/jobs/{id}` | Trả trạng thái, kết quả, lỗi và Correlation ID của job. |
 
-`POST /api/videos/upload` thực hiện:
+`GET /jobs/{id}/result` trả artifact lưu trên MinIO. Job có `Id`, `VideoId`, `JobType`, `Status`, `Progress`, `OutputPath`, `Result`, `CreatedAt` và `UpdatedAt`.
 
-1. Nhận `IFormFile file`.
-2. Sinh GUID với định dạng chuỗi.
-3. Tạo object name `GUID + phần mở rộng file`.
-4. Upload stream tới MinIO.
-5. Lưu `VideoMetadata` trạng thái `Pending` vào MongoDB.
-6. Publish `VideoUploadedMessage` qua RabbitMQ.
-7. Trả `202 Accepted` cùng `videoId`.
+Các route trên đều có alias bắt đầu bằng `/api`, ví dụ `/api/videos/{id}`. `GET /health` kiểm tra MongoDB và trả HTTP 503 nếu không kết nối được.
 
-#### Endpoint danh sách
-
-`GET /api/videos` truy vấn toàn bộ collection và sắp xếp `UploadedAt` giảm dần trước khi trả kết quả JSON.
+Khi upload, API tạo GUID làm video ID và object name, lưu file trước rồi ghi metadata. Tạo job là thao tác độc lập; API tạo Job trạng thái `Pending`, lưu vào MongoDB rồi publish message. Nếu publish phát sinh lỗi, API đánh dấu job `Failed` thay vì để bản ghi Pending vô thời hạn.
 
 ### 4.3 Video.Worker
 
-Worker kế thừa `BackgroundService` và dùng RabbitMQ async consumer. Khi nhận message:
+Worker sử dụng `AsyncEventingBasicConsumer`, queue chính durable và `autoAck: false`. Prefetch bằng 1 để giới hạn một message chưa xác nhận trên mỗi consumer. Khi nhận message:
 
-1. Giải mã JSON thành `VideoUploadedMessage`.
-2. Cập nhật MongoDB trạng thái `Processing`.
-3. Tải object tương ứng từ MinIO vào file tạm trên worker.
-4. Chờ `Task.Delay(5000)` để mô phỏng xử lý nặng.
-5. Cập nhật MongoDB trạng thái `Completed`.
-6. Xóa file tạm trong `finally`.
-7. Gửi BasicAck để loại message khỏi queue.
+1. Đọc `JobId`, `VideoId`, loại job và Correlation ID.
+2. Truy vấn MongoDB; nếu job đã `Completed`, bỏ qua xử lý và ack message.
+3. Worker atomically chuyển job `Pending` sang `Processing` để chỉ một consumer nhận quyền xử lý; duplicate được bỏ qua. Tải file từ MinIO và cập nhật tiến độ 25%, 60%, 100%.
+4. Tạo thumbnail JPEG bằng FFmpeg, metadata JSON hoặc artifact JSON mô phỏng transcode; tải artifact lên MinIO, lưu `OutputPath`/`Result`, cập nhật trạng thái video rồi mới `BasicAck`.
+5. Khi lỗi, publish message persistent sang retry queue hoặc DLQ rồi ack bản gốc. Nếu publish thất bại, nack với `requeue=true` để không loại bỏ message.
 
-Nếu xử lý hoặc tải file lỗi, Worker cập nhật `Failed` rồi dùng BasicNack. Nếu không cập nhật được trạng thái MongoDB, message được requeue để thử lại.
+Worker chỉ đánh dấu `Failed` khi hết lượt retry và message được chuyển vào DLQ. Mặc định có 3 lượt retry sau lần thử ban đầu, delay 5 giây qua queue TTL. Worker health endpoint tại cổng nội bộ 8082 kiểm tra MongoDB và trạng thái RabbitMQ connection.
 
-### 4.4 Web.Client
+### 4.4 RabbitMQ và độ bền message
 
-Web.Client là Blazor Server trên .NET 10.
+Queue `video-uploaded` được khai báo `durable=true`; publisher đặt `DeliveryMode=Persistent`. Queue retry `video-uploaded.retry` durable, có `x-message-ttl`, và dead-letter routing message trở lại queue chính sau khi hết TTL. Queue `video-uploaded.dead` durable, giữ message lỗi vượt giới hạn.
 
-- Đăng ký named `HttpClient` trỏ tới API.
-- Dùng `InputFile` để chọn file.
-- Gửi file dạng `multipart/form-data` tới API.
-- Hiển thị bảng `Id`, `FileName`, `UploadedAt` và `Status`.
-- Dùng `PeriodicTimer` 3 giây để gọi `GET /api/videos` định kỳ.
-- Hủy timer bằng `CancellationTokenSource` khi component bị dispose.
+Worker dùng manual ack. Ack được gửi sau khi ghi kết quả thành công, sau khi xác nhận job đã Completed, hoặc sau khi publish bản sao persistent vào retry/DLQ. Nack/requeue được dùng khi không thể chuyển message lỗi sang queue tiếp theo. Kết nối RabbitMQ thử lại khi khởi động với backoff giới hạn.
 
-### 4.5 MongoDB
+### 4.5 MongoDB và MinIO
 
-Bản ghi metadata được ánh xạ bởi `BsonId`:
+MongoDB lưu hai nhóm dữ liệu:
 
-- `Id`: GUID dạng string.
-- `FileName`: tên file gốc.
-- `Status`: `Pending`, `Processing`, `Completed` hoặc `Failed`.
-- `UploadedAt`: thời điểm upload.
+- Collection `Videos`: ID, tên file, trạng thái và thời điểm upload.
+- Collection `Jobs`: ID, video liên quan, loại job, trạng thái, tiến độ, output path, thời điểm tạo/cập nhật, kết quả/lỗi và Correlation ID.
+
+MinIO lưu file nguồn trong bucket `videos`, object key được tạo từ video ID và phần mở rộng tên file; artifact lưu dưới `processed/{videoId}/{jobId}`. File tạm trong Worker được xóa trong `finally`.
+
+### 4.6 Correlation ID và logging
+
+Middleware API nhận `X-Correlation-ID`; nếu thiếu hoặc không hợp lệ, API tạo ID mới và trả lại trong response header. ID đi vào message body và header RabbitMQ `CorrelationId`. Worker dùng structured logging scopes với Correlation ID, JobId và VideoId để lọc log theo cùng một luồng nghiệp vụ.
 
 ## 5. Cơ chế giao tiếp phân tán
 
-### 5.1 REST/HTTP
+### 5.1 HTTP
 
-Blazor giao tiếp với API bằng HTTP. Upload dùng multipart POST; danh sách trạng thái dùng GET JSON. Đây là giao diện đồng bộ phù hợp với tương tác người dùng.
+Web.Client gọi API bằng HTTP. Upload dùng `multipart/form-data`; các thao tác tạo job và đọc trạng thái dùng JSON/HTTP. API trả `202 Accepted` khi job đã được ghi và đưa vào RabbitMQ.
 
-### 5.2 RabbitMQ
+### 5.2 Message queue
 
-API phát message trên queue `video-uploaded`. Worker đăng ký queue với prefetch count là 1, nên mỗi Worker chỉ nhận một message chưa ack tại một thời điểm. Ack xác nhận xử lý thành công; Nack xử lý trường hợp thất bại.
+API là producer, Worker là consumer. `VideoJobMessage` mang JobId, VideoId, tên file, loại job và Correlation ID. Queue durable cùng message persistent giúp message tồn tại qua việc RabbitMQ restart theo cấu hình broker. Retry queue đưa message về queue chính sau delay; sau khi đạt giới hạn, Worker đưa message vào DLQ để kiểm tra.
 
-### 5.3 MinIO
+### 5.3 Lưu trữ
 
-File được lưu theo object name `VideoId + phần mở rộng`. API upload bằng stream; Worker tải object bằng callback stream và ghi ra file tạm.
+MongoDB là nguồn dữ liệu trạng thái có thể truy vấn; MinIO lưu payload video dung lượng lớn. Tách hai loại dữ liệu cho phép scale và sao lưu độc lập.
 
-### 5.4 MongoDB
+## 6. Cách triển khai
 
-MongoDB lưu trạng thái metadata độc lập với nội dung file. API và Worker dùng cùng collection để các trạng thái thay đổi có thể được đọc realtime qua endpoint danh sách.
+### 6.1 Cấu hình môi trường
 
-## 6. Triển khai Docker
+Sao chép `.env.example` thành `.env` tại thư mục gốc và thay credential local trước khi dùng. `.env` được ignore bởi Git. Compose yêu cầu `MONGODB_CONNECTION_STRING`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`, `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS` và `RABBITMQ_URI`. Các host bên trong container dùng tên service trên Docker network.
 
-Mỗi project `.NET` có Dockerfile multi-stage riêng:
-
-- SDK image thực hiện restore và publish.
-- Runtime hoặc ASP.NET runtime image chứa artifact cuối.
-- Build context là thư mục solution để Dockerfile truy cập `Video.Contracts`.
-
-Docker Compose khởi động sáu service:
-
-- `mongodb`
-- `minio`
-- `rabbitmq`
-- `video-api`
-- `video-worker`
-- `web-client`
-
-Tất cả service ở chung network `video_network`. Environment variables ghi đè chuỗi `localhost` trong `appsettings.json` bằng service name nội bộ.
-
-### Bảng port
-
-| Service | Cổng host | Cổng container |
-|---|---:|---:|
-| Web.Client | 8080 | 8080 |
-| Video.API | 8081 | 8080 |
-| MongoDB | 27017 | 27017 |
-| MinIO API | 9000 | 9000 |
-| MinIO Console | 9001 | 9001 |
-| RabbitMQ AMQP | 5672 | 5672 |
-| RabbitMQ Management | 15672 | 15672 |
-
-### Các lệnh triển khai
+### 6.2 Khởi động bằng Docker Compose
 
 ```powershell
-docker compose config
+Copy-Item .env.example .env
+docker compose config --quiet
 docker compose build
 docker compose up -d
 docker compose ps
-docker compose logs -f
 ```
 
-Mở giao diện: `http://localhost:8080`.
+Compose chạy MongoDB, MinIO, RabbitMQ, Video.API, Video.Worker và Web.Client; named volume giữ dữ liệu sau khi container dừng.
 
-## 7. Hướng dẫn kiểm thử luồng nghiệp vụ
+Compose hiện pin image `bitnamilegacy/minio` đã ngừng cập nhật; cấu hình này chỉ dành cho bài tập/local development và cần thay bằng image được duy trì trước triển khai lâu dài.
 
-1. Mở `http://localhost:8080`.
-2. Chọn một file video bằng `InputFile`.
-3. Nhấn Upload.
-4. API trả `202 Accepted` và metadata xuất hiện với trạng thái `Pending`.
-5. Worker đặt trạng thái `Processing`.
-6. Sau khoảng 5 giây Worker đặt trạng thái `Completed`.
-7. Quan sát bảng tự làm mới sau mỗi 3 giây.
-8. Kiểm tra object trong MinIO Console và message queue trong RabbitMQ Management nếu cần.
+| Thành phần | Cổng host |
+| --- | ---: |
+| Web.Client | `.env`: `WEB_CLIENT_HOST_PORT` |
+| Video.API | `.env`: `VIDEO_API_HOST_PORT` |
+| MongoDB | `.env`: `MONGODB_HOST_PORT` |
+| MinIO API / Console | `.env`: `MINIO_API_HOST_PORT` / `MINIO_CONSOLE_HOST_PORT` |
+| RabbitMQ AMQP / Management | `.env`: `RABBITMQ_AMQP_HOST_PORT` / `RABBITMQ_MANAGEMENT_HOST_PORT` |
+
+Compose healthcheck các dịch vụ MongoDB, MinIO, RabbitMQ, API và Worker; API/Worker đợi các dependency khỏe mạnh, Web.Client đợi API khỏe mạnh.
+
+### 6.3 Kiểm thử thủ công
+
+1. Mở `http://localhost:8080` hoặc upload trực tiếp qua `POST /videos`.
+2. Lấy `videoId` từ response và gọi `POST /videos/{videoId}/jobs`.
+3. Dùng `GET /jobs/{jobId}` theo dõi trạng thái.
+4. Dùng `GET /videos/{videoId}` kiểm tra video cùng danh sách jobs.
+5. Xem log bằng `docker compose logs -f video-api video-worker` và queue bằng RabbitMQ Management.
+
+Build source ngoài Docker:
+
+```powershell
+dotnet build src/Video.API/Video.API.csproj
+dotnet build src/Video.Worker/Video.Worker.csproj
+dotnet build src/Web.Client/Web.Client.csproj
+```
+
+Khi chạy ngoài Docker, phải cấp connection string, endpoint và credentials bằng environment variables; không có cấu hình localhost/secret mặc định trong appsettings.
+
+## 7. Kết quả thực hiện
+
+- Hoàn thiện năm endpoint nghiệp vụ và alias `/api`; bổ sung tải artifact tại `/jobs/{id}/result`.
+- Upload file vào MinIO và video metadata vào MongoDB; tách Job thành bản ghi riêng.
+- Worker xử lý message persistent bằng manual ack/nack.
+- Idempotency dùng atomic claim trên job `Pending`, bỏ qua duplicate không đủ điều kiện claim.
+- Retry queue có TTL và DLQ riêng, với retry tối đa cấu hình được.
+- API và Worker có health endpoint; Docker Compose thăm dò trạng thái container.
+- Correlation ID đi từ header HTTP qua RabbitMQ tới structured log của Worker.
+- Blazor hỗ trợ chọn loại job, lọc trạng thái, xem tiến độ/kết quả và tải artifact.
+- API, Worker và Web.Client đã được kiểm tra build trong môi trường phát triển. Cảnh báo dependency transitives SharpCompress/Snappier được ghi nhận; cần lập kế hoạch cập nhật dependency riêng.
 
 ## 8. Đánh giá hệ thống
 
-### Ưu điểm
+### Khả năng chịu lỗi
 
-- Tách API và xử lý nền theo nguyên tắc producer/consumer.
-- Khả năng scale Worker theo số lượng queue consumer.
-- Nội dung file và metadata được lưu riêng, phù hợp lưu trữ object.
-- Docker Compose giúp toàn bộ hạ tầng khởi động nhất quán.
-- UI cập nhật trạng thái định kỳ mà không cần reload trang.
+- Nếu Worker dừng trước ack, RabbitMQ có thể redeliver message chưa được xác nhận khi consumer/channel mất kết nối.
+- Nếu job đã Completed nhưng message bị redeliver, kiểm tra trạng thái MongoDB giúp bỏ qua lần xử lý trùng.
+- Queue durable và message persistent giảm nguy cơ mất message khi broker restart; độ bền thực tế còn phụ thuộc cấu hình persistence/replication của RabbitMQ và storage.
+- Lỗi xử lý được retry có delay; lỗi kéo dài được cô lập trong DLQ thay vì lặp vô hạn.
+- Healthcheck cho phép Docker nhận biết API/Worker không thể truy cập MongoDB hoặc Worker mất kết nối RabbitMQ.
 
-### Hạn chế
+### Tính năng mở rộng đã triển khai
 
-- Tương tác Worker hiện chỉ mô phỏng bằng `Task.Delay(5000)`, chưa tích hợp FFmpeg thật.
-- Chưa có cơ chế retry/backoff và dead-letter queue đầy đủ.
-- Chưa có xác thực hoặc phân quyền cho API và giao diện.
-- Chưa giới hạn kích thước loại file ở mức nghiệp vụ ngoài giới hạn upload của Blazor.
-- Cơ chế xử lý Worker trong báo cáo là mẫu đơn giản, chưa có theo dõi worker health hoặc distributed tracing.
+- Idempotent consumer dựa trên trạng thái Job trong MongoDB.
+- Dead-letter queue riêng và retry queue có TTL.
+- Correlation ID cho truy vết request/message/log.
+- API hỗ trợ route có và không có `/api`.
+- Cấu hình secrets/host qua environment thay vì hardcode trong appsettings.
 
-### Hướng phát triển
+### Hạn chế và hướng phát triển
 
-- Tích hợp FFmpeg để transcode, nén hoặc tạo thumbnail.
-- Thêm dead-letter queue và retry policy có thời gian chờ tăng dần.
-- Thêm SignalR để đẩy trạng thái realtime thay vì polling.
-- Thêm OpenAPI, kiểm tra dữ liệu và authentication/authorization.
-- Thêm health endpoint và telemetry với Prometheus/OpenTelemetry.
-- Tách cấu hình credentials khỏi Compose bằng Docker secrets hoặc secret manager.
+- Tác vụ transcode hiện chỉ tạo JSON mô phỏng; cần tích hợp FFmpeg profile/codec thật nếu yêu cầu chuyển mã video.
+- Chưa có transactional outbox: lỗi tiến trình giữa lúc ghi Job MongoDB và publish RabbitMQ có thể để lại job Pending không có message. Nên dùng outbox hoặc cơ chế reconciliation khi đưa vào production.
+- Publish/retry hiện dùng persistent messages nhưng chưa bật publisher confirms; cần bổ sung confirms và xử lý kết quả xác nhận để tăng đảm bảo giao nhận.
+- Hệ thống chưa có xác thực/phân quyền, giới hạn loại file/kích thước ở tầng nghiệp vụ đầy đủ, TLS, secret manager hoặc giám sát metrics/tracing.
+- API health hiện xác minh MongoDB; Worker health xác minh MongoDB, RabbitMQ và MinIO.
+- Cần bổ sung integration tests cho upload, job lifecycle, retry/DLQ và phục hồi khi Worker restart.

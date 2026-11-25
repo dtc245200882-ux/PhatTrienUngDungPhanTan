@@ -1,85 +1,89 @@
-# Video Processing System
+# Hệ thống xử lý video bất đồng bộ
 
-Hệ thống mẫu xử lý video bất đồng bộ, xây dựng bằng .NET 10 và Docker Compose. API nhận video, lưu file gốc vào MinIO, lưu metadata vào MongoDB và gửi message đến RabbitMQ. Worker đọc message, cập nhật trạng thái và giả lập xử lý video trong 5 giây. Giao diện Blazor Server cho phép upload và theo dõi trạng thái.
+> Bài tập lớn Đề tài 14, xây dựng trên .NET 10, ASP.NET Core Minimal API, Blazor Server, RabbitMQ, MongoDB và MinIO.
 
-## Kiến trúc
+## Tổng quan
 
-```text
-Browser
-  |
-  v
-Web.Client (Blazor Server) ---> Video.API (Minimal API)
-                                      |       |       |
-                                      v       v       v
-                                   MinIO  MongoDB  RabbitMQ
-                                                     |
-                                                     v
-                                                Video.Worker
-                                                  |       |
-                                                  v       v
-                                                MinIO  MongoDB
-```
-
-- **Video.API**: `POST /api/videos/upload` nhận multipart form field `file`; upload file vào bucket `videos`, tạo metadata trạng thái `Pending` rồi publish `VideoUploadedMessage`. `GET /api/videos` trả metadata, video mới nhất trước.
-- **Video.Worker**: consume queue `video-uploaded`, chuyển trạng thái `Processing`, tải file từ MinIO, chờ 5 giây để giả lập xử lý, cập nhật `Completed` hoặc `Failed`, rồi ack/nack message.
-- **MongoDB**: lưu `VideoId`, tên file, trạng thái và thời điểm upload.
-- **MinIO**: lưu file video gốc.
-- **RabbitMQ**: chuyển message upload từ API đến Worker.
-- **Web.Client**: Blazor Server gọi API để upload và làm mới danh sách video mỗi 3 giây.
+`Video.API` nhận video và lưu file vào MinIO, metadata vào MongoDB. Client tạo một job xử lý riêng; API ghi job vào MongoDB và publish message persistent lên RabbitMQ. `Video.Worker` consume với manual acknowledgement, cập nhật tiến độ của job và video. Lỗi được retry qua queue có TTL; hết số lần retry thì message được chuyển vào DLQ.
 
 ## Yêu cầu
 
-- Hệ điều hành Windows 10/11 hoặc Linux/macOS hỗ trợ Docker Desktop/Engine.
-- `.NET SDK 10.0` để build và chạy source ngoài Docker.
-- Docker Desktop hoặc Docker Engine với Docker Compose v2.
-- Kết nối Internet để pull các image lần đầu.
+Compose hiện pin image `bitnamilegacy/minio` đã ngừng cập nhật, chỉ phù hợp cho bài tập/local development. Thay bằng MinIO/AiStor image được duy trì và cấp quyền sử dụng trước khi triển khai lâu dài.
 
-## Cấu trúc source
+## Chạy hệ thống
 
-```text
-src/
-├── Video.Contracts/       # Record dùng chung qua RabbitMQ
-├── Video.API/             # ASP.NET Core Minimal API
-├── Video.Worker/          # Worker Service xử lý bất đồng bộ
-└── Web.Client/            # Blazor Server
-```
-
-## Chạy bằng Docker Compose
-
-Mở PowerShell tại thư mục gốc repository:
+Tại thư mục gốc repository, tạo `.env` từ template:
 
 ```powershell
-docker compose config
-docker compose build
-docker compose up -d
+Copy-Item .env.example .env
+```
+
+Các giá trị trong `.env.example` chỉ dành cho local development. Thay credential trước khi chia sẻ môi trường; không commit `.env`.
+
+Kiểm tra cấu hình, build image và khởi động:
+
+```powershell
+docker compose config --quiet
+docker compose up -d --build
 docker compose ps
 ```
 
-Compose khởi động MongoDB, MinIO, RabbitMQ, Video.API, Video.Worker và Web.Client trên network `video_network`. Các ứng dụng liên lạc qua service name trong Docker; không dùng `localhost` cho kết nối nội bộ.
+Mở giao diện tại [http://localhost:8080](http://localhost:8080). Video API chạy tại [http://localhost:8081](http://localhost:8081). Docker theo dõi API tại `/health` và Worker tại cổng health nội bộ `8082`.
 
-Mở giao diện tại **http://localhost:8080**. Các địa chỉ dịch vụ khác:
+## API
 
-| Dịch vụ | URL/Port từ máy host |
-| --- | --- |
-| Web.Client | http://localhost:8080 |
-| Video.API | http://localhost:8081 |
-| Danh sách video | http://localhost:8081/api/videos |
-| MongoDB | `localhost:27017` |
-| MinIO API | http://localhost:9000 |
-| MinIO Console | http://localhost:9001 |
-| RabbitMQ AMQP | `localhost:5672` |
-| RabbitMQ Management | http://localhost:15672 |
+Năm endpoint nghiệp vụ hỗ trợ cả đường dẫn có và không có tiền tố `/api`:
 
-Thông tin đăng nhập mặc định phục vụ local development:
+| Phương thức | Đường dẫn | Mô tả |
+| --- | --- | --- |
+| `POST` | `/videos` | Multipart form field `file`; lưu file vào MinIO và metadata vào MongoDB. |
+| `POST` | `/videos/{id}/jobs` | Tạo job `Thumbnail`, `Metadata` hoặc `Transcode` (JSON `{ "jobType": "Metadata" }`), lưu job và gửi message đến RabbitMQ. |
+| `GET` | `/videos` | Liệt kê video mới nhất trước; hỗ trợ `?status=Completed` (các trạng thái `Uploaded`, `Pending`, `Processing`, `Completed`, `Failed`). |
+| `GET` | `/videos/{id}` | Chi tiết video và danh sách job liên quan. |
+| `GET` | `/jobs/{id}` | Trạng thái, kết quả, lỗi và Correlation ID của job. |
 
-- MinIO: `minioadmin` / `minioadmin`
-- RabbitMQ: `videoapp` / `videoapp_password`
+`GET /jobs/{id}/result` tải artifact của job sau khi hoàn tất. Job lưu `JobType`, `Status`, `Progress`, `OutputPath`, `Result`, `CreatedAt` và `UpdatedAt` trong collection `Jobs`, tách biệt collection `Videos`.
 
-Có thể ghi đè các giá trị trên bằng biến môi trường hoặc file `.env` ở thư mục gốc. Không dùng các mật khẩu mặc định này cho môi trường production. `.env` đã được thêm vào `.gitignore`.
+Các route tương ứng cũng có tiền tố `/api`, ví dụ `/api/videos` và `/api/jobs/{id}`. Ngoài ra `GET /health` trả trạng thái API và kiểm tra kết nối MongoDB.
 
-## Build và chạy riêng từng project
+### Thử nhanh bằng PowerShell
 
-Từ thư mục gốc:
+Upload file (dùng `curl.exe` để gọi curl thay vì alias PowerShell):
+
+```powershell
+curl.exe -i -H "X-Correlation-ID: demo-video-001" -F "file=@C:\path\to\sample.mp4" http://localhost:8081/videos
+```
+
+Lưu `videoId` trong JSON response, sau đó tạo job:
+
+```powershell
+curl.exe -i -H "X-Correlation-ID: demo-video-001" -H "Content-Type: application/json" -d '{"jobType":"Metadata"}' -X POST http://localhost:8081/videos/{videoId}/jobs
+```
+
+Lưu tiếp `jobId` trong response để tra cứu:
+
+```powershell
+curl.exe http://localhost:8081/videos/{videoId}
+curl.exe http://localhost:8081/jobs/{jobId}
+curl.exe http://localhost:8081/videos
+curl.exe http://localhost:8081/videos?status=Completed
+curl.exe -L -o result.json http://localhost:8081/jobs/{jobId}/result
+curl.exe http://localhost:8081/health
+```
+
+Có thể thay `/videos` bằng `/api/videos` trong mọi route tương ứng. Upload hiện lưu file và đăng ký video; bước tạo job là request riêng.
+
+## Cấu hình
+
+`docker-compose.yml` nhận thông tin kết nối và credential qua biến môi trường được nạp từ `.env`:
+
+- `MONGODB_CONNECTION_STRING`
+- `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD`
+- `RABBITMQ_DEFAULT_USER`, `RABBITMQ_DEFAULT_PASS`, `RABBITMQ_URI`
+
+`appsettings.json` không chứa connection string, host hay credential. Khi chạy app ngoài Docker, cần cấp cùng các cấu hình bằng environment variables, ví dụ `MongoDB__ConnectionString`, `MinIO__Endpoint`, `MinIO__AccessKey`, `MinIO__SecretKey` và `RabbitMQ__Uri`.
+
+## Build ngoài Docker
 
 ```powershell
 dotnet build src/Video.API/Video.API.csproj
@@ -87,26 +91,21 @@ dotnet build src/Video.Worker/Video.Worker.csproj
 dotnet build src/Web.Client/Web.Client.csproj
 ```
 
-Khi chạy ngoài Docker, các `appsettings.json` mặc định dùng `localhost`; cần bảo đảm MongoDB, MinIO và RabbitMQ đang chạy trên các port mặc định tương ứng.
+Khi chạy trực tiếp, cấu hình host/credentials phải được cung cấp qua environment. Các dịch vụ MongoDB, MinIO và RabbitMQ cần sẵn sàng trước khi chạy API/Worker.
 
-## Logs và dừng hệ thống
-
-```powershell
-docker compose logs -f
-docker compose logs -f video-api video-worker
-docker compose down
-```
-
-`docker compose down` giữ lại dữ liệu trong các named volume. Chỉ dùng `docker compose down -v` khi chủ ý xóa dữ liệu MongoDB, MinIO và RabbitMQ.
-
-## Ghi chú MinIO
-
-Compose hiện pin digest `bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c` (bản `2025.5.24`) vì registry image MinIO chính thức không cho phép pull trong môi trường triển khai này. Đây là image legacy đã ngừng cập nhật, chỉ dùng cho bài tập/local development; không dùng cho production. Với triển khai lâu dài, hãy thay bằng image MinIO/AiStor được tổ chức của bạn cấp quyền truy cập và duy trì.
-
-## Kiểm tra sau khi khởi động
+## Quan sát và dừng
 
 ```powershell
 docker compose ps
-docker compose logs --tail=100 video-api video-worker web-client
-Invoke-RestMethod http://localhost:8081/api/videos
+docker compose logs -f video-api video-worker
+docker compose logs -f rabbitmq
+docker compose down
 ```
+
+RabbitMQ Management: [http://localhost:15672](http://localhost:15672). Queue chính là `video-uploaded`, retry queue là `video-uploaded.retry`, DLQ là `video-uploaded.dead`. Mặc định Worker chạy tối đa 3 lần retry sau lần xử lý ban đầu, mỗi lần chờ 5 giây.
+
+Các named volume giữ dữ liệu sau `docker compose down`. Chỉ chạy `docker compose down -v` khi chủ ý xóa dữ liệu MongoDB, MinIO và RabbitMQ.
+
+## Phạm vi xử lý hiện tại
+
+Worker tải object nguồn từ MinIO, cập nhật tiến độ 25%, 60%, 100% trong MongoDB và ghi artifact kết quả về MinIO. `Thumbnail` dùng FFmpeg để tạo ảnh JPEG; `Metadata` tạo JSON từ thông tin file; `Transcode` tạo JSON minh họa và không thực hiện chuyển mã codec thật. Cần thay thông tin đăng nhập local, bổ sung TLS/secret manager và bật xác thực/phân quyền trước khi triển khai production.
