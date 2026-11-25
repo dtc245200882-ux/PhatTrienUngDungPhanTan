@@ -98,8 +98,35 @@ th,
 
 .upload-controls {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(150px, auto) auto;
     gap: 12px;
+}
+
+.job-type-picker {
+    display: grid;
+    min-width: 150px;
+    gap: 5px;
+    align-content: center;
+}
+
+.job-type-picker span,
+.filter-row label {
+    color: #728078;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+
+.job-type-picker select,
+.filter-row select {
+    min-height: 38px;
+    padding: 0 30px 0 10px;
+    border: 1px solid #cbd6cf;
+    border-radius: 4px;
+    background: #fff;
+    color: #20372f;
+    font: inherit;
+    font-size: 12px;
 }
 
 .file-picker {
@@ -222,6 +249,13 @@ th,
     padding-bottom: 14px;
 }
 
+.filter-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 0 12px;
+}
+
 .live-state {
     display: flex;
     align-items: center;
@@ -288,6 +322,93 @@ td code {
     color: #65756d;
     font-family: Consolas, "Courier New", monospace;
     font-size: 11px;
+}
+
+.details-button {
+    padding: 6px 9px;
+    border: 1px solid #cbd6cf;
+    border-radius: 4px;
+    background: #fff;
+    color: #245d48;
+    font-size: 11px;
+    font-weight: 650;
+    cursor: pointer;
+}
+
+.details-button:hover {
+    background: #f2f8f4;
+}
+
+.details-row td {
+    height: auto;
+    padding: 0 16px;
+    background: #f7faf8;
+    white-space: normal;
+}
+
+.detail-empty {
+    display: block;
+    padding: 16px 0;
+    color: #758179;
+}
+
+.job-row {
+    padding: 14px 0;
+    border-bottom: 1px solid #dce4df;
+}
+
+.job-row:last-child {
+    border-bottom: 0;
+}
+
+.job-summary {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.job-summary strong {
+    color: #20372f;
+    font-size: 12px;
+}
+
+.job-summary code,
+.job-progress {
+    color: #65756d;
+    font-size: 11px;
+}
+
+.job-progress {
+    font-variant-numeric: tabular-nums;
+}
+
+.result-link {
+    color: #245d48;
+    font-size: 11px;
+    font-weight: 650;
+}
+
+.job-row progress {
+    display: block;
+    width: min(100%, 360px);
+    height: 7px;
+    margin-top: 10px;
+    accent-color: #287044;
+}
+
+.job-result,
+.job-error {
+    margin: 8px 0 0;
+    font-size: 11px;
+}
+
+.job-result {
+    color: #485851;
+}
+
+.job-error {
+    color: #a53d2b;
 }
 
 .date-cell {
@@ -373,6 +494,10 @@ td code {
 
     .upload-controls {
         grid-template-columns: 1fr;
+    }
+
+    .job-type-picker {
+        min-width: 0;
     }
 
     .upload-button {

@@ -38,6 +38,14 @@
 				</span>
 				<span class="file-browse">BROWSE</span>
 			</label>
+			<label class="job-type-picker">
+				<span>PROCESSING TYPE</span>
+				<select @bind="_selectedJobType" aria-label="Processing type">
+					<option value="Thumbnail">Thumbnail</option>
+					<option value="Metadata">Metadata</option>
+					<option value="Transcode">Transcode</option>
+				</select>
+			</label>
 			<button class="upload-button" @onclick="UploadAsync" disabled="@(_selectedFile is null || _isUploading)">
 				<span>@(_isUploading ? "Uploading..." : "Upload video")</span>
 				<span aria-hidden="true">&#8599;</span>
@@ -65,6 +73,17 @@
 				<span>@(_errorMessage is null ? "LIVE" : "API OFFLINE")</span>
 			</div>
 		</div>
+		<div class="filter-row">
+			<label for="video-status-filter">STATUS</label>
+			<select id="video-status-filter" value="@_statusFilter" @onchange="HandleStatusFilterChanged">
+				<option value="">All videos</option>
+				<option value="Pending">Pending</option>
+				<option value="Processing">Processing</option>
+				<option value="Completed">Completed</option>
+				<option value="Failed">Failed</option>
+				<option value="Uploaded">Uploaded</option>
+			</select>
+		</div>
 
 		@if (_videos.Count == 0 && _isLoading)
 		{
@@ -87,6 +106,7 @@
 							<th scope="col">VIDEO ID</th>
 							<th scope="col">UPLOADED</th>
 							<th scope="col">STATUS</th>
+							<th scope="col">JOBS</th>
 						</tr>
 					</thead>
 					<tbody>
@@ -97,7 +117,43 @@
 								<td><code title="@video.Id">@ShortId(video.Id)</code></td>
 								<td class="date-cell">@video.UploadedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")</td>
 								<td><span class="status-badge @StatusClass(video.Status)">@video.Status</span></td>
+								<td><button class="details-button" @onclick="() => ToggleDetailsAsync(video.Id)">@(IsExpanded(video.Id) ? "Hide" : "View jobs")</button></td>
 							</tr>
+							@if (IsExpanded(video.Id))
+							{
+								<tr class="details-row">
+									<td colspan="6">
+										@if (JobsFor(video.Id).Count == 0)
+										{
+											<span class="detail-empty">No processing jobs for this video.</span>
+										}
+										@foreach (var job in JobsFor(video.Id))
+										{
+											<div class="job-row" @key="job.Id">
+												<div class="job-summary">
+													<strong>@job.JobType</strong>
+													<span class="status-badge @StatusClass(job.Status)">@job.Status</span>
+													<code>@ShortId(job.Id)</code>
+													<span class="job-progress">@job.Progress%</span>
+													@if (!string.IsNullOrWhiteSpace(job.OutputPath))
+													{
+														<a class="result-link" href="api/jobs/@job.Id/result" target="_blank" rel="noopener">Download result</a>
+													}
+												</div>
+												<progress max="100" value="@job.Progress" aria-label="@($"{job.JobType} progress")"></progress>
+												@if (!string.IsNullOrWhiteSpace(job.Result))
+												{
+													<p class="job-result">@job.Result</p>
+												}
+												@if (!string.IsNullOrWhiteSpace(job.Error))
+												{
+													<p class="job-error">@job.Error</p>
+												}
+											</div>
+										}
+									</td>
+								</tr>
+							}
 						}
 					</tbody>
 				</table>
@@ -110,7 +166,11 @@
 	private const long MaxUploadSize = 1_000_000_000;
 	private readonly CancellationTokenSource _refreshCancellation = new();
 	private List<VideoListItem> _videos = [];
+	private readonly Dictionary<string, List<JobListItem>> _jobsByVideo = [];
+	private readonly HashSet<string> _expandedVideoIds = [];
 	private IBrowserFile? _selectedFile;
+	private string _selectedJobType = "Metadata";
+	private string _statusFilter = string.Empty;
 	private Task? _refreshTask;
 	private string? _errorMessage;
 	private string? _uploadMessage;
@@ -153,11 +213,14 @@
 					? "application/octet-stream"
 					: _selectedFile.ContentType);
 			multipart.Add(fileContent, "file", _selectedFile.Name);
+			var correlationId = Guid.NewGuid().ToString("N");
 
-			using var response = await Http.PostAsync(
-				"api/videos/upload",
-				multipart,
-				_refreshCancellation.Token);
+			using var uploadRequest = new HttpRequestMessage(HttpMethod.Post, "api/videos")
+			{
+				Content = multipart
+			};
+			uploadRequest.Headers.Add("X-Correlation-ID", correlationId);
+			using var response = await Http.SendAsync(uploadRequest, _refreshCancellation.Token);
 
 			if (!response.IsSuccessStatusCode)
 			{
@@ -165,7 +228,28 @@
 				return;
 			}
 
-			_uploadMessage = "Upload accepted. The video is now in the queue.";
+			var upload = await response.Content.ReadFromJsonAsync<UploadResponse>(
+				cancellationToken: _refreshCancellation.Token);
+			if (upload is null || string.IsNullOrWhiteSpace(upload.VideoId))
+			{
+				_errorMessage = "The upload response did not contain a video ID.";
+				return;
+			}
+
+			using var jobRequest = new HttpRequestMessage(HttpMethod.Post, $"api/videos/{upload.VideoId}/jobs")
+			{
+				Content = JsonContent.Create(new CreateJobRequest(_selectedJobType))
+			};
+			jobRequest.Headers.Add("X-Correlation-ID", correlationId);
+			using var jobResponse = await Http.SendAsync(jobRequest, _refreshCancellation.Token);
+			if (!jobResponse.IsSuccessStatusCode)
+			{
+				_errorMessage = $"Video uploaded, but job creation failed with HTTP {(int)jobResponse.StatusCode}.";
+				await RefreshVideosAsync();
+				return;
+			}
+
+			_uploadMessage = "Upload accepted and processing job queued.";
 			_selectedFile = null;
 			await RefreshVideosAsync();
 		}
@@ -189,9 +273,13 @@
 		_isLoading = true;
 		try
 		{
+			var query = string.IsNullOrWhiteSpace(_statusFilter)
+				? "api/videos"
+				: $"api/videos?status={Uri.EscapeDataString(_statusFilter)}";
 			_videos = await Http.GetFromJsonAsync<List<VideoListItem>>(
-				"api/videos",
+				query,
 				_refreshCancellation.Token) ?? [];
+			await Task.WhenAll(_videos.Select(RefreshVideoJobsAsync));
 			_errorMessage = null;
 		}
 		catch (OperationCanceledException) when (_refreshCancellation.IsCancellationRequested)
@@ -206,6 +294,43 @@
 			_isLoading = false;
 		}
 	}
+
+	private async Task RefreshVideoJobsAsync(VideoListItem video)
+	{
+		var details = await Http.GetFromJsonAsync<VideoDetailResponse>(
+			$"api/videos/{video.Id}",
+			_refreshCancellation.Token);
+		_jobsByVideo[video.Id] = details?.Jobs ?? [];
+	}
+
+	private async Task ToggleDetailsAsync(string videoId)
+	{
+		if (!_expandedVideoIds.Add(videoId))
+		{
+			_expandedVideoIds.Remove(videoId);
+			return;
+		}
+
+		if (!_jobsByVideo.ContainsKey(videoId))
+		{
+			var video = _videos.FirstOrDefault(item => item.Id == videoId);
+			if (video is not null)
+			{
+				await RefreshVideoJobsAsync(video);
+			}
+		}
+	}
+
+	private Task HandleStatusFilterChanged(ChangeEventArgs args)
+	{
+		_statusFilter = args.Value?.ToString() ?? string.Empty;
+		return RefreshVideosAsync();
+	}
+
+	private bool IsExpanded(string videoId) => _expandedVideoIds.Contains(videoId);
+
+	private List<JobListItem> JobsFor(string videoId) =>
+		_jobsByVideo.TryGetValue(videoId, out var jobs) ? jobs : [];
 
 	private async Task RefreshLoopAsync(CancellationToken cancellationToken)
 	{
@@ -234,6 +359,15 @@
 		"failed" => "failed",
 		_ => "unknown"
 	};
+
+	private sealed record UploadResponse(string VideoId);
+	private sealed record CreateJobRequest(string JobType);
+	private sealed record VideoDetailResponse(
+		string Id,
+		string FileName,
+		string Status,
+		DateTimeOffset UploadedAt,
+		List<JobListItem> Jobs);
 
 	private static string ShortId(string id) => id.Length > 8 ? id[..8] : id;
 
