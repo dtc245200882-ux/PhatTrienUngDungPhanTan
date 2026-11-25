@@ -10,7 +10,11 @@ COPY src/Video.Worker/ src/Video.Worker/
 WORKDIR /src/src/Video.Worker
 RUN dotnet publish "Video.Worker.csproj" -c Release -o /app/publish --no-restore /p:UseAppHost=false
 
-FROM mcr.microsoft.com/dotnet/runtime:10.0 AS final
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends curl ffmpeg \
+	&& rm -rf /var/lib/apt/lists/*
+EXPOSE 8082
 COPY --from=build /app/publish .
 ENTRYPOINT ["dotnet", "Video.Worker.dll"]
