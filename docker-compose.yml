@@ -75,7 +75,7 @@ services:
       RabbitMQ__Uri: ${RABBITMQ_URI:?Set RABBITMQ_URI in .env}
       RabbitMQ__QueueName: video-uploaded
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:${VIDEO_API_CONTAINER_PORT}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS ${VIDEO_API_HEALTH_URL:?Set VIDEO_API_HEALTH_URL in .env} || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -112,9 +112,11 @@ services:
       RabbitMQ__QueueName: video-uploaded
       RabbitMQ__MaxRetries: 3
       RabbitMQ__RetryDelayMilliseconds: 5000
+      Health__Scheme: ${WORKER_HEALTH_SCHEME:?Set WORKER_HEALTH_SCHEME in .env}
+      Health__BindAddress: ${WORKER_HEALTH_BIND_ADDRESS:?Set WORKER_HEALTH_BIND_ADDRESS in .env}
       Health__Port: ${WORKER_HEALTH_PORT:?Set WORKER_HEALTH_PORT in .env}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:$${Health__Port}/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS ${WORKER_HEALTH_URL:?Set WORKER_HEALTH_URL in .env} || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
