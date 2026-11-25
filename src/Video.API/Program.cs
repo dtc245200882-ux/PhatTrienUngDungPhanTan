@@ -1,11 +1,15 @@
 using Minio;
 using Minio.DataModel.Args;
+using Microsoft.AspNetCore.Http.Features;
+using MongoDB.Bson;
 using MongoDB.Driver;
 using Video.API.Models;
 using Video.API.Services;
-using Video.Contracts.Messages;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Logging.AddSimpleConsole(options => options.IncludeScopes = true);
+builder.WebHost.ConfigureKestrel(options => options.Limits.MaxRequestBodySize = 1_000_000_000);
+builder.Services.Configure<FormOptions>(options => options.MultipartBodyLengthLimit = 1_000_000_000);
 
 var mongoConnectionString = builder.Configuration["MongoDB:ConnectionString"]
     ?? throw new InvalidOperationException("MongoDB:ConnectionString is required.");
@@ -28,6 +32,10 @@ builder.Services.AddSingleton(sp =>
     sp.GetRequiredService<IMongoClient>()
         .GetDatabase(mongoDatabaseName)
         .GetCollection<VideoMetadata>(mongoCollectionName));
+builder.Services.AddSingleton(sp =>
+    sp.GetRequiredService<IMongoClient>()
+        .GetDatabase(mongoDatabaseName)
+        .GetCollection<JobMetadata>(builder.Configuration["MongoDB:JobsCollectionName"] ?? "Jobs"));
 builder.Services.AddSingleton<IMinioClient>(_ => new MinioClient()
     .WithEndpoint(minioEndpoint)
     .WithCredentials(minioAccessKey, minioSecretKey)
@@ -37,6 +45,21 @@ builder.Services.AddSingleton<RabbitMqPublisher>();
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    var correlationId = context.Request.Headers["X-Correlation-ID"].FirstOrDefault();
+    if (string.IsNullOrWhiteSpace(correlationId) || correlationId.Length > 128)
+    {
+        correlationId = Guid.NewGuid().ToString("N");
+    }
+
+    context.Response.Headers["X-Correlation-ID"] = correlationId;
+    using (app.Logger.BeginScope("CorrelationId:{CorrelationId}", correlationId))
+    {
+        await next();
+    }
+});
+
 var minioClient = app.Services.GetRequiredService<IMinioClient>();
 var bucketExists = await minioClient.BucketExistsAsync(
     new BucketExistsArgs().WithBucket(bucketName));
@@ -45,65 +68,21 @@ if (!bucketExists)
     await minioClient.MakeBucketAsync(new MakeBucketArgs().WithBucket(bucketName));
 }
 
-app.MapGet("/api/videos", async (
-    IMongoCollection<VideoMetadata> videos,
-    CancellationToken cancellationToken) =>
+VideoEndpoints.Map(app.MapGroup(""), bucketName);
+VideoEndpoints.Map(app.MapGroup("/api"), bucketName);
+
+app.MapGet("/health", async (IMongoClient mongoClient, CancellationToken cancellationToken) =>
 {
-    var records = await videos.Find(Builders<VideoMetadata>.Filter.Empty)
-        .SortByDescending(video => video.UploadedAt)
-        .ToListAsync(cancellationToken);
-
-    var response = records.Select(video => new VideoMetadataResponse(
-        video.Id,
-        video.FileName,
-        video.Status,
-        new DateTimeOffset(DateTime.SpecifyKind(video.UploadedAt, DateTimeKind.Utc))));
-
-    return Results.Ok(response);
+    try
+    {
+        await mongoClient.GetDatabase("admin").RunCommandAsync<BsonDocument>(
+            new BsonDocument("ping", 1), cancellationToken: cancellationToken);
+        return Results.Ok(new { status = "healthy" });
+    }
+    catch
+    {
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
 });
-
-app.MapPost("/api/videos/upload", async (
-    IFormFile file,
-    IMongoCollection<VideoMetadata> videos,
-    IMinioClient storage,
-    RabbitMqPublisher publisher,
-    CancellationToken cancellationToken) =>
-{
-    if (file.Length == 0)
-    {
-        return Results.BadRequest(new { error = "The uploaded file is empty." });
-    }
-
-    var videoId = Guid.NewGuid().ToString("D");
-    var objectName = $"{videoId}{Path.GetExtension(file.FileName)}";
-
-    await using (var stream = file.OpenReadStream())
-    {
-        await storage.PutObjectAsync(new PutObjectArgs()
-            .WithBucket(bucketName)
-            .WithObject(objectName)
-            .WithStreamData(stream)
-            .WithObjectSize(file.Length)
-            .WithContentType(string.IsNullOrWhiteSpace(file.ContentType)
-                ? "application/octet-stream"
-                : file.ContentType), cancellationToken);
-    }
-
-    var metadata = new VideoMetadata
-    {
-        Id = videoId,
-        FileName = Path.GetFileName(file.FileName),
-        Status = "Pending",
-        UploadedAt = DateTime.UtcNow
-    };
-    await videos.InsertOneAsync(metadata, cancellationToken: cancellationToken);
-
-    await publisher.PublishAsync(
-        new VideoUploadedMessage(videoId, metadata.FileName),
-        cancellationToken);
-
-    return Results.Accepted(value: new { videoId });
-})
-.DisableAntiforgery();
 
 app.Run();
