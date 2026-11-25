@@ -99,7 +99,7 @@ public static class VideoEndpoints
                     item => item.Id == job.Id,
                     Builders<JobMetadata>.Update
                         .Set(item => item.Status, "Failed")
-                        .Set(item => item.Error, "The job could not be published to the message broker.")
+                        .Set(item => item.ErrorMessage, "The job could not be published to the message broker.")
                         .Set(item => item.UpdatedAt, DateTime.UtcNow),
                     cancellationToken: CancellationToken.None);
                 await videos.UpdateOneAsync(

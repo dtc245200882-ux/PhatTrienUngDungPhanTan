@@ -8,6 +8,8 @@
     <PackageReference Include="Minio" Version="6.0.3" />
     <PackageReference Include="MongoDB.Driver" Version="3.4.3" />
     <PackageReference Include="RabbitMQ.Client" Version="7.1.2" />
+    <PackageReference Include="SharpCompress" Version="0.50.11" />
+    <PackageReference Include="Snappier" Version="1.3.3" />
     <ProjectReference Include="..\Video.Contracts\Video.Contracts.csproj" />
   </ItemGroup>
 </Project>

@@ -145,9 +145,9 @@
 												{
 													<p class="job-result">@job.Result</p>
 												}
-												@if (!string.IsNullOrWhiteSpace(job.Error))
+												@if (!string.IsNullOrWhiteSpace(job.ErrorMessage))
 												{
-													<p class="job-error">@job.Error</p>
+													<p class="job-error">@job.ErrorMessage</p>
 												}
 											</div>
 										}

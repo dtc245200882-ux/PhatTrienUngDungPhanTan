@@ -14,5 +14,5 @@ public sealed class JobMetadata
     public DateTime CreatedAt { get; set; }
     public DateTime UpdatedAt { get; set; }
     public string? Result { get; set; }
-    public string? Error { get; set; }
+    public string? ErrorMessage { get; set; }
 }

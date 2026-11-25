@@ -71,13 +71,25 @@ if (!bucketExists)
 VideoEndpoints.Map(app.MapGroup(""), bucketName);
 VideoEndpoints.Map(app.MapGroup("/api"), bucketName);
 
-app.MapGet("/health", async (IMongoClient mongoClient, CancellationToken cancellationToken) =>
+app.MapGet("/health", async (
+    IMongoClient mongoClient,
+    IMinioClient storage,
+    RabbitMqPublisher publisher,
+    CancellationToken cancellationToken) =>
 {
     try
     {
         await mongoClient.GetDatabase("admin").RunCommandAsync<BsonDocument>(
             new BsonDocument("ping", 1), cancellationToken: cancellationToken);
-        return Results.Ok(new { status = "healthy" });
+        var bucketReady = await storage.BucketExistsAsync(
+            new BucketExistsArgs().WithBucket(bucketName), cancellationToken);
+        var rabbitReady = await publisher.IsReadyAsync(cancellationToken);
+        if (!bucketReady || !rabbitReady)
+        {
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+
+        return Results.Ok(new { status = "Healthy" });
     }
     catch
     {

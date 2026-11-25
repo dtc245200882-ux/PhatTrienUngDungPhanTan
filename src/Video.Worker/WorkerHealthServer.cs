@@ -18,9 +18,14 @@ public sealed class WorkerHealthServer(
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var healthPort = configuration.GetValue("Health:Port", 8082);
+        var healthPort = configuration.GetValue<int?>("Health:Port")
+            ?? throw new InvalidOperationException("Health:Port is required.");
+        var healthScheme = configuration["Health:Scheme"]
+            ?? throw new InvalidOperationException("Health:Scheme is required.");
+        var healthBindAddress = configuration["Health:BindAddress"]
+            ?? throw new InvalidOperationException("Health:BindAddress is required.");
         var builder = WebApplication.CreateSlimBuilder();
-        builder.WebHost.UseUrls($"http://0.0.0.0:{healthPort}");
+        builder.WebHost.UseUrls($"{healthScheme}://{healthBindAddress}:{healthPort}");
         var app = builder.Build();
         app.MapGet("/health", async (CancellationToken cancellationToken) =>
         {

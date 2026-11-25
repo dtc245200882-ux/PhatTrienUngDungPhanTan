@@ -51,7 +51,17 @@ public sealed class VideoProcessingWorker : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await using var channel = await _rabbitConnection.CreateChannelAsync(cancellationToken: stoppingToken);
-        await channel.QueueDeclareAsync(_queueName, true, false, false, cancellationToken: stoppingToken);
+        await channel.QueueDeclareAsync(
+            _queueName,
+            true,
+            false,
+            false,
+            arguments: new Dictionary<string, object?>
+            {
+                ["x-dead-letter-exchange"] = string.Empty,
+                ["x-dead-letter-routing-key"] = _deadLetterQueueName
+            },
+            cancellationToken: stoppingToken);
         await channel.QueueDeclareAsync(_deadLetterQueueName, true, false, false, cancellationToken: stoppingToken);
         await channel.QueueDeclareAsync(
             _retryQueueName,
@@ -102,26 +112,43 @@ public sealed class VideoProcessingWorker : BackgroundService
             {
                 _logger.LogError(exception, "Failed to process video job {JobId}.", message?.JobId);
                 var retryCount = ReadRetryCount(delivery.BasicProperties.Headers);
-                var nextQueue = retryCount < _maxRetries ? _retryQueueName : _deadLetterQueueName;
+                if (retryCount < _maxRetries)
+                {
+                    try
+                    {
+                        if (message is not null)
+                        {
+                            await UpdateJobAsync(message.JobId, "Pending", 0, null, null, exception.Message, CancellationToken.None);
+                            await UpdateVideoStatusAsync(message.VideoId, CancellationToken.None);
+                        }
+
+                        await PublishRetryAsync(channel, delivery, _retryQueueName, retryCount + 1, exception.Message);
+                        await channel.BasicAckAsync(delivery.DeliveryTag, false, CancellationToken.None);
+                        _logger.LogWarning("Routed message to retry queue after attempt {Attempt}.", retryCount + 1);
+                    }
+                    catch (Exception retryException)
+                    {
+                        _logger.LogError(retryException, "Could not route message to retry queue; requeueing it.");
+                        await channel.BasicNackAsync(delivery.DeliveryTag, false, true, CancellationToken.None);
+                    }
+                    return;
+                }
+
                 try
                 {
                     if (message is not null)
                     {
-                        var status = nextQueue == _deadLetterQueueName ? "Failed" : "Pending";
-                        var progress = nextQueue == _deadLetterQueueName ? (int?)null : 0;
-                        await UpdateJobAsync(message.JobId, status, progress, null, null, exception.Message, CancellationToken.None);
+                        await UpdateJobAsync(message.JobId, "Failed", null, null, null, exception.Message, CancellationToken.None);
                         await UpdateVideoStatusAsync(message.VideoId, CancellationToken.None);
                     }
-
-                    await PublishRetryAsync(channel, delivery, nextQueue, retryCount + 1, exception.Message);
-                    await channel.BasicAckAsync(delivery.DeliveryTag, false, CancellationToken.None);
-                    _logger.LogWarning("Routed message to {QueueName} after attempt {Attempt}.", nextQueue, retryCount + 1);
                 }
-                catch (Exception publishException)
+                catch (Exception updateException)
                 {
-                    _logger.LogError(publishException, "Could not route failed message; requeueing it.");
-                    await channel.BasicNackAsync(delivery.DeliveryTag, false, true, CancellationToken.None);
+                    _logger.LogError(updateException, "Could not persist terminal job failure before dead-lettering.");
                 }
+
+                await channel.BasicNackAsync(delivery.DeliveryTag, false, false, CancellationToken.None);
+                _logger.LogError("Rejected message after {Attempts} attempts; broker routed it to the dead-letter queue.", retryCount + 1);
             }
         };
 
@@ -147,7 +174,7 @@ public sealed class VideoProcessingWorker : BackgroundService
                 .Set(job => job.Status, "Processing")
                 .Set(job => job.Progress, 0)
                 .Set(job => job.OutputPath, null)
-                .Set(job => job.Error, null)
+                .Set(job => job.ErrorMessage, null)
                 .Set(job => job.UpdatedAt, now),
             cancellationToken: cancellationToken);
         if (claim.MatchedCount > 0)
@@ -312,7 +339,7 @@ public sealed class VideoProcessingWorker : BackgroundService
             .Set(job => job.UpdatedAt, DateTime.UtcNow)
             .Set(job => job.OutputPath, outputPath)
             .Set(job => job.Result, result)
-            .Set(job => job.Error, error);
+            .Set(job => job.ErrorMessage, error);
         if (progress.HasValue)
         {
             update = update.Set(job => job.Progress, progress.Value);

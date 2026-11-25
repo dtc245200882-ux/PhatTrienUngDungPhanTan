@@ -8,7 +8,7 @@ public sealed record JobListItem(
     int Progress,
     string? OutputPath,
     string? Result,
-    string? Error,
+    string? ErrorMessage,
     DateTime CreatedAt,
     DateTime UpdatedAt,
     string CorrelationId);

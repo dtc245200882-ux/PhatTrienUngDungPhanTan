@@ -15,6 +15,5 @@ WORKDIR /app
 RUN apt-get update \
 	&& apt-get install -y --no-install-recommends curl ffmpeg \
 	&& rm -rf /var/lib/apt/lists/*
-EXPOSE 8082
 COPY --from=build /app/publish .
 ENTRYPOINT ["dotnet", "Video.Worker.dll"]

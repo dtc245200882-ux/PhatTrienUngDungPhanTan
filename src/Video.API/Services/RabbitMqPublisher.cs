@@ -28,22 +28,13 @@ public sealed class RabbitMqPublisher : IAsyncDisposable
         await _publishLock.WaitAsync(cancellationToken);
         try
         {
-            if (_channel is null)
-            {
-                _connection = await _factory.CreateConnectionAsync(cancellationToken);
-                _channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
-                await _channel.QueueDeclareAsync(
-                    queue: _queueName,
-                    durable: true,
-                    exclusive: false,
-                    autoDelete: false,
-                    arguments: null,
-                    cancellationToken: cancellationToken);
-            }
+            await EnsureChannelAsync(cancellationToken);
+            var channel = _channel
+                ?? throw new InvalidOperationException("RabbitMQ channel initialization failed.");
 
             var body = JsonSerializer.SerializeToUtf8Bytes(message);
             var correlationId = typeof(T).GetProperty("CorrelationId")?.GetValue(message)?.ToString();
-            await _channel.BasicPublishAsync(
+            await channel.BasicPublishAsync(
                 exchange: string.Empty,
                 routingKey: _queueName,
                 mandatory: false,
@@ -63,6 +54,63 @@ public sealed class RabbitMqPublisher : IAsyncDisposable
         {
             _publishLock.Release();
         }
+    }
+
+    public async Task<bool> IsReadyAsync(CancellationToken cancellationToken)
+    {
+        await _publishLock.WaitAsync(cancellationToken);
+        try
+        {
+            await EnsureChannelAsync(cancellationToken);
+            return _connection?.IsOpen == true && _channel?.IsOpen == true;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return false;
+        }
+        finally
+        {
+            _publishLock.Release();
+        }
+    }
+
+    private async Task EnsureChannelAsync(CancellationToken cancellationToken)
+    {
+        if (_connection?.IsOpen == true && _channel?.IsOpen == true)
+        {
+            return;
+        }
+
+        if (_channel is not null)
+        {
+            await _channel.DisposeAsync();
+            _channel = null;
+        }
+        if (_connection is not null)
+        {
+            await _connection.DisposeAsync();
+            _connection = null;
+        }
+
+        _connection = await _factory.CreateConnectionAsync(cancellationToken);
+        _channel = await _connection.CreateChannelAsync(cancellationToken: cancellationToken);
+        await _channel.QueueDeclareAsync(
+            queue: _queueName,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: new Dictionary<string, object?>
+            {
+                ["x-dead-letter-exchange"] = string.Empty,
+                ["x-dead-letter-routing-key"] = $"{_queueName}.dead"
+            },
+            cancellationToken: cancellationToken);
+        await _channel.QueueDeclareAsync(
+            queue: $"{_queueName}.dead",
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            cancellationToken: cancellationToken);
     }
 
     public async ValueTask DisposeAsync()
