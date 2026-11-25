@@ -28,7 +28,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Mở giao diện tại [http://localhost:8080](http://localhost:8080). Video API chạy tại [http://localhost:8081](http://localhost:8081). Docker theo dõi API tại `/health` và Worker tại cổng health nội bộ `8082`.
+Các cổng host mặc định (có thể đổi trong `.env`): Web.Client `8080`, Video.API `8081`, MongoDB `27017`, MinIO API/Console `9000`/`9001`, RabbitMQ AMQP/Management `5672`/`15672`. Mở giao diện tại [http://localhost:8080](http://localhost:8080), API tại [http://localhost:8081](http://localhost:8081), MinIO Console tại [http://localhost:9001](http://localhost:9001) và RabbitMQ Management tại [http://localhost:15672](http://localhost:15672). API `/health` kiểm tra MongoDB, RabbitMQ và bucket MinIO; Worker health dùng cổng nội bộ cấu hình trong `.env`.
 
 ## API
 
@@ -42,9 +42,9 @@ Năm endpoint nghiệp vụ hỗ trợ cả đường dẫn có và không có t
 | `GET` | `/videos/{id}` | Chi tiết video và danh sách job liên quan. |
 | `GET` | `/jobs/{id}` | Trạng thái, kết quả, lỗi và Correlation ID của job. |
 
-`GET /jobs/{id}/result` tải artifact của job sau khi hoàn tất. Job lưu `JobType`, `Status`, `Progress`, `OutputPath`, `Result`, `CreatedAt` và `UpdatedAt` trong collection `Jobs`, tách biệt collection `Videos`.
+`GET /jobs/{id}/result` tải artifact của job sau khi hoàn tất. Job lưu `Id`, `VideoId`, `JobType`, `Status`, `Progress`, `OutputPath`, `Result`, `ErrorMessage`, `CreatedAt` và `UpdatedAt` trong collection `Jobs`, tách biệt collection `Videos`.
 
-Các route tương ứng cũng có tiền tố `/api`, ví dụ `/api/videos` và `/api/jobs/{id}`. Ngoài ra `GET /health` trả trạng thái API và kiểm tra kết nối MongoDB.
+Các route tương ứng cũng có tiền tố `/api`, ví dụ `/api/videos` và `/api/jobs/{id}`. Ngoài ra `GET /health` trả `{"status":"Healthy"}` khi MongoDB, RabbitMQ và bucket MinIO đều sẵn sàng; nếu một dependency lỗi thì trả HTTP 503.
 
 ### Thử nhanh bằng PowerShell
 
@@ -89,9 +89,17 @@ Có thể thay `/videos` bằng `/api/videos` trong mọi route tương ứng. U
 dotnet build src/Video.API/Video.API.csproj
 dotnet build src/Video.Worker/Video.Worker.csproj
 dotnet build src/Web.Client/Web.Client.csproj
+dotnet build UNGDUNGPHANTAN.sln
 ```
 
 Khi chạy trực tiếp, cấu hình host/credentials phải được cung cấp qua environment. Các dịch vụ MongoDB, MinIO và RabbitMQ cần sẵn sàng trước khi chạy API/Worker.
+
+Sau khi Compose đã chạy, kiểm thử end-to-end gồm tạo MP4 thật, chạy Thumbnail/Metadata, kiểm tra filter, pause/resume Worker và xác nhận DLQ:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+.\scripts\validate-e2e.ps1
+```
 
 ## Quan sát và dừng
 
@@ -109,3 +117,5 @@ Các named volume giữ dữ liệu sau `docker compose down`. Chỉ chạy `doc
 ## Phạm vi xử lý hiện tại
 
 Worker tải object nguồn từ MinIO, cập nhật tiến độ 25%, 60%, 100% trong MongoDB và ghi artifact kết quả về MinIO. `Thumbnail` dùng FFmpeg để tạo ảnh JPEG; `Metadata` tạo JSON từ thông tin file; `Transcode` tạo JSON minh họa và không thực hiện chuyển mã codec thật. Cần thay thông tin đăng nhập local, bổ sung TLS/secret manager và bật xác thực/phân quyền trước khi triển khai production.
+
+Worker retry kết nối RabbitMQ khi khởi động, dùng durable/persistent delivery, manual ack và prefetch 1. Lỗi tạm thời được đưa qua retry queue TTL; hết retry thì job chuyển Failed và broker dead-letter message vào DLQ bằng reject không requeue. NuGet audit hiện không báo advisory cho các project.
