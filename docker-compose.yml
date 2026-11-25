@@ -3,7 +3,7 @@ services:
     image: mongo:8
     restart: unless-stopped
     ports:
-      - "27017:27017"
+      - "${MONGODB_HOST_PORT:?Set MONGODB_HOST_PORT in .env}:${MONGODB_CONTAINER_PORT:?Set MONGODB_CONTAINER_PORT in .env}"
     volumes:
       - mongodb_data:/data/db
     healthcheck:
@@ -19,15 +19,15 @@ services:
     image: bitnamilegacy/minio@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
     restart: unless-stopped
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_API_HOST_PORT:?Set MINIO_API_HOST_PORT in .env}:${MINIO_API_CONTAINER_PORT:?Set MINIO_API_CONTAINER_PORT in .env}"
+      - "${MINIO_CONSOLE_HOST_PORT:?Set MINIO_CONSOLE_HOST_PORT in .env}:${MINIO_CONSOLE_CONTAINER_PORT:?Set MINIO_CONSOLE_CONTAINER_PORT in .env}"
     volumes:
       - minio_data:/bitnami/minio/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "${MINIO_HEALTH_URL:?Set MINIO_HEALTH_URL in .env}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -39,11 +39,11 @@ services:
     image: rabbitmq:4-management
     restart: unless-stopped
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-videoapp}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-videoapp_password}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "${RABBITMQ_AMQP_HOST_PORT:?Set RABBITMQ_AMQP_HOST_PORT in .env}:${RABBITMQ_AMQP_CONTAINER_PORT:?Set RABBITMQ_AMQP_CONTAINER_PORT in .env}"
+      - "${RABBITMQ_MANAGEMENT_HOST_PORT:?Set RABBITMQ_MANAGEMENT_HOST_PORT in .env}:${RABBITMQ_MANAGEMENT_CONTAINER_PORT:?Set RABBITMQ_MANAGEMENT_CONTAINER_PORT in .env}"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -62,19 +62,26 @@ services:
     image: video-api:local
     restart: unless-stopped
     environment:
-      ASPNETCORE_HTTP_PORTS: "8080"
-      MongoDB__ConnectionString: mongodb://mongodb:27017
+      ASPNETCORE_HTTP_PORTS: ${VIDEO_API_CONTAINER_PORT:?Set VIDEO_API_CONTAINER_PORT in .env}
+      MongoDB__ConnectionString: ${MONGODB_CONNECTION_STRING:?Set MONGODB_CONNECTION_STRING in .env}
       MongoDB__DatabaseName: VideoProcessingDb
       MongoDB__CollectionName: Videos
-      MinIO__Endpoint: minio:9000
-      MinIO__AccessKey: ${MINIO_ROOT_USER:-minioadmin}
-      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MongoDB__JobsCollectionName: Jobs
+      MinIO__Endpoint: ${MINIO_ENDPOINT:?Set MINIO_ENDPOINT in .env}
+      MinIO__AccessKey: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
       MinIO__UseSSL: "false"
       MinIO__BucketName: videos
-      RabbitMQ__Uri: "amqp://${RABBITMQ_DEFAULT_USER:-videoapp}:${RABBITMQ_DEFAULT_PASS:-videoapp_password}@rabbitmq:5672/"
+      RabbitMQ__Uri: ${RABBITMQ_URI:?Set RABBITMQ_URI in .env}
       RabbitMQ__QueueName: video-uploaded
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${VIDEO_API_CONTAINER_PORT}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     ports:
-      - "8081:8080"
+      - "${VIDEO_API_HOST_PORT:?Set VIDEO_API_HOST_PORT in .env}:${VIDEO_API_CONTAINER_PORT:?Set VIDEO_API_CONTAINER_PORT in .env}"
     depends_on:
       mongodb:
         condition: service_healthy
@@ -92,16 +99,26 @@ services:
     image: video-worker:local
     restart: unless-stopped
     environment:
-      MongoDB__ConnectionString: mongodb://mongodb:27017
+      MongoDB__ConnectionString: ${MONGODB_CONNECTION_STRING:?Set MONGODB_CONNECTION_STRING in .env}
       MongoDB__DatabaseName: VideoProcessingDb
       MongoDB__CollectionName: Videos
-      MinIO__Endpoint: minio:9000
-      MinIO__AccessKey: ${MINIO_ROOT_USER:-minioadmin}
-      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MongoDB__JobsCollectionName: Jobs
+      MinIO__Endpoint: ${MINIO_ENDPOINT:?Set MINIO_ENDPOINT in .env}
+      MinIO__AccessKey: ${MINIO_ROOT_USER:?Set MINIO_ROOT_USER in .env}
+      MinIO__SecretKey: ${MINIO_ROOT_PASSWORD:?Set MINIO_ROOT_PASSWORD in .env}
       MinIO__UseSSL: "false"
       MinIO__BucketName: videos
-      RabbitMQ__Uri: "amqp://${RABBITMQ_DEFAULT_USER:-videoapp}:${RABBITMQ_DEFAULT_PASS:-videoapp_password}@rabbitmq:5672/"
+      RabbitMQ__Uri: ${RABBITMQ_URI:?Set RABBITMQ_URI in .env}
       RabbitMQ__QueueName: video-uploaded
+      RabbitMQ__MaxRetries: 3
+      RabbitMQ__RetryDelayMilliseconds: 5000
+      Health__Port: ${WORKER_HEALTH_PORT:?Set WORKER_HEALTH_PORT in .env}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:$${Health__Port}/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on:
       mongodb:
         condition: service_healthy
@@ -119,12 +136,13 @@ services:
     image: web-client:local
     restart: unless-stopped
     environment:
-      ASPNETCORE_HTTP_PORTS: "8080"
-      VideoApi__BaseUrl: http://video-api:8080/
+      ASPNETCORE_HTTP_PORTS: ${WEB_CLIENT_CONTAINER_PORT:?Set WEB_CLIENT_CONTAINER_PORT in .env}
+      VideoApi__BaseUrl: ${VIDEO_API_BASE_URL:?Set VIDEO_API_BASE_URL in .env}
     ports:
-      - "8080:8080"
+      - "${WEB_CLIENT_HOST_PORT:?Set WEB_CLIENT_HOST_PORT in .env}:${WEB_CLIENT_CONTAINER_PORT:?Set WEB_CLIENT_CONTAINER_PORT in .env}"
     depends_on:
-      - video-api
+      video-api:
+        condition: service_healthy
     networks:
       - video_network
 
