@@ -138,8 +138,11 @@ public sealed class VideoProcessingWorker : BackgroundService
     private async Task<bool> TryClaimJobAsync(VideoJobMessage message, CancellationToken cancellationToken)
     {
         var now = DateTime.UtcNow;
+        var processingLeaseExpiredAt = now.AddMinutes(-5);
         var claim = await _jobs.UpdateOneAsync(
-            job => job.Id == message.JobId && job.Status == "Pending",
+            job => job.Id == message.JobId &&
+                (job.Status == "Pending" ||
+                    (job.Status == "Processing" && job.UpdatedAt < processingLeaseExpiredAt)),
             Builders<JobMetadata>.Update
                 .Set(job => job.Status, "Processing")
                 .Set(job => job.Progress, 0)
